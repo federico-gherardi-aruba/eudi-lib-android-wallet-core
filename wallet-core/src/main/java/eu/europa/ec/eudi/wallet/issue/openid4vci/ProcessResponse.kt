@@ -43,6 +43,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.io.bytestring.ByteString
 import org.multipaz.storage.Storage
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.resume
 
 internal class ProcessResponse(
@@ -137,6 +138,12 @@ internal class ProcessResponse(
                 issuedDocument to trustResult
             }.onSuccess { (document, trustResult) ->
                 issuedDocumentIds.add(document.id)
+
+                // Notify before the listener: a throwing listener must not skip the acceptance notification
+                outcome.notificationId?.let { notifId ->
+                    notifyIssuerAsync(CredentialIssuanceEvent.Accepted(id = notifId, description = null))
+                }
+
                 listener(IssueEvent.DocumentIssued(document, trustResult))
                 // Store issuance metadata in background coroutine
                 CoroutineScope(Dispatchers.IO).launch {
@@ -147,16 +154,14 @@ internal class ProcessResponse(
                         (outcome as? SubmissionOutcome.Success)?.selectedCredentialReusePolicy,
                     )
                 }
-
-                outcome.notificationId?.let { notifId ->
-                    notifyIssuerAsync(CredentialIssuanceEvent.Accepted(id = notifId, description = null))
-                }
             }.onFailure { error ->
-                documentManager.deleteDocumentById(unsignedDocument.id)
-                listener(IssueEvent.DocumentFailed(unsignedDocument, error))
+                // Notify before cleanup and listener: neither should be able to skip the failure notification
                 outcome.notificationId?.let { notifId ->
                     notifyIssuerAsync(CredentialIssuanceEvent.Failed(id = notifId, description = error.message))
                 }
+
+                documentManager.deleteDocumentById(unsignedDocument.id)
+                listener(IssueEvent.DocumentFailed(unsignedDocument, error))
             }
 
             is SubmissionOutcome.Failed -> {
@@ -200,8 +205,9 @@ internal class ProcessResponse(
     private fun notifyIssuerAsync(event: CredentialIssuanceEvent) {
         CoroutineScope(Dispatchers.IO).launch {
             runCatching {
-                with(issuer) { authorizedRequest.notify(event) }
+                with(issuer) { authorizedRequest.notify(event) }.getOrThrow()
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 logger?.d(TAG, "Failed to notify issuer for notification ${event.id.value}: ${error.message}")
             }
         }
